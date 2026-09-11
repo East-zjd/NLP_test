@@ -1,0 +1,15 @@
+# python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# 日志、结果文件
+eval_result*.json
+*.log
+# 模型、数据集大文件
+Qwen*/
+*.bin
+*.safetensors
+# 环境
+.venv/
+env/

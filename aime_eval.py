@@ -13,7 +13,7 @@ enable_thinking = True
 
 # 加载AIME26数据集
 print("Loading AIME26 dataset from HuggingFace...")
-dataset = load_dataset("math-ai/aime26")
+dataset = load_dataset("math-ai/aime26", cache_dir="/mnt/data/user/zhang_jingdong/hf_cache")
 aime_data = dataset["test"]
 print(f"AIME26 total test problems: {len(aime_data)}")
 

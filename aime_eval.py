@@ -38,8 +38,14 @@ def main() -> None:
         records.append({"question": str(question), "gold": int(item["answer"])})
     params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
                             top_k=top_k, repetition_penalty=repetition_penalty)
+    # ``load_in_8bit`` was removed from newer vLLM EngineArgs.  Passing it
+    # causes ``unexpected keyword argument`` before the model is loaded.
+    # Quantized checkpoints should instead be loaded according to their own
+    # quantization metadata (or with the vLLM version-specific quantization
+    # option).  The original parameter is retained above for configuration
+    # compatibility but is not forwarded to unsupported vLLM versions.
     llm = LLM(model=model_dir, tensor_parallel_size=tensor_parallel_size,
-              load_in_8bit=load_in_8bit, trust_remote_code=True, device="cuda")
+              trust_remote_code=True, device="cuda")
     results, correct = [], 0
     for record, output in zip(records, llm.generate(prompts, params)):
         raw = output.outputs[0].text if output.outputs else ""

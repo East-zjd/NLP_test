@@ -6,7 +6,7 @@ import torch.multiprocessing as mp
 from datasets import load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-max_new_tokens, temperature, enable_thinking = 8192, 0.85, True
+max_new_tokens, temperature, enable_thinking = 2048, 0.85, True
 top_p, top_k, repetition_penalty = 0.95, 20, 1.05
 MODEL_PATH = "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B"
 HF_CACHE = "/mnt/data/user/zhang_jingdong/hf_cache"

@@ -1,65 +1,86 @@
-"""Evaluate Qwen3.5-2B on AIME26 with vLLM."""
-import json, os, re
-from typing import Any, Dict, Optional
+"""Run Qwen3.5-2B on math-ai/aime26 using vLLM."""
+
+import json
+import os
+import re
+from pathlib import Path
+
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
-model_dir = "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B"
+
+# Required evaluation parameters: do not change.
 max_new_tokens, temperature, enable_thinking = 32768, 0.85, True
 top_p, top_k, repetition_penalty = 0.95, 20, 1.05
-final_result_path = "/mnt/data/user/zhang_jingdong/NLP_test/eval_result.json"
-sub_log_dir = "/mnt/data/user/zhang_jingdong/NLP_test/sub_logs"
-tensor_parallel_size, load_in_8bit = 8, True
 
-def build_prompt(question: str) -> str:
-    thinking = "Show your reasoning step by step before the answer." if enable_thinking else ""
-    return ("You are solving an AIME mathematics problem.\n" + thinking + "\n"
-            "Return the final answer as an integer from 0 to 999, enclosed exactly in "
-            "\\boxed{...}.\n\nProblem:\n" + question + "\n")
+MODEL_PATH = "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B"
+DATASET_NAME = "math-ai/aime26"
+HF_CACHE = "/mnt/data/user/zhang_jingdong/hf_cache"
+RESULT_PATH = "/mnt/data/user/zhang_jingdong/NLP_test/eval_result.json"
+TENSOR_PARALLEL_SIZE = 8
 
-def extract_answer(text: str) -> Optional[int]:
-    for pattern in (r"\\boxed\s*\{\s*(\d{1,3})\s*\}",
-                    r"(?:final\s+answer|answer)\s*[:：]\s*\**\s*(\d{1,3})\b",
-                    r"\b(\d{1,3})\s*(?:is\s+the\s+)?final\s+answer\b"):
-        matches = re.findall(pattern, text, flags=re.IGNORECASE)
-        if matches and 0 <= int(matches[-1]) <= 999:
-            return int(matches[-1])
+
+def prompt(question: str) -> str:
+    reasoning = "Think through the problem step by step." if enable_thinking else ""
+    return (
+        "Solve the following AIME problem. " + reasoning + "\n"
+        "Give the final answer as an integer from 0 to 999 in exactly the form "
+        r"\boxed{integer}." + "\n\nProblem:\n" + question
+    )
+
+
+def answer_from(text: str):
+    """Return the last valid AIME answer found in model output."""
+    patterns = [r"\\boxed\s*\{\s*(\d{1,3})\s*\}",
+                r"(?:final\s+)?answer\s*[:：]\s*(\d{1,3})\b"]
+    for pattern in patterns:
+        found = re.findall(pattern, text, re.IGNORECASE)
+        if found:
+            value = int(found[-1])
+            if 0 <= value <= 999:
+                return value
     return None
 
+
 def main() -> None:
-    dataset = load_dataset("math-ai/aime26", cache_dir="/mnt/data/user/zhang_jingdong/hf_cache")
-    split = dataset["test"] if hasattr(dataset, "keys") and "test" in dataset else dataset
-    prompts, records = [], []
-    for item in split:
-        question = item.get("problem") or item.get("question")
-        if question is None or item.get("answer") is None:
-            raise KeyError("AIME item must contain problem/question and answer")
-        prompts.append(build_prompt(str(question)))
-        records.append({"question": str(question), "gold": int(item["answer"])})
-    params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
-                            top_k=top_k, repetition_penalty=repetition_penalty)
-    # ``load_in_8bit`` was removed from newer vLLM EngineArgs.  Passing it
-    # causes ``unexpected keyword argument`` before the model is loaded.
-    # Quantized checkpoints should instead be loaded according to their own
-    # quantization metadata (or with the vLLM version-specific quantization
-    # option).  The original parameter is retained above for configuration
-    # compatibility but is not forwarded to unsupported vLLM versions.
-    # Newer vLLM versions select CUDA automatically and no longer accept
-    # ``device`` in EngineArgs. CUDA_VISIBLE_DEVICES controls GPU selection.
-    llm = LLM(model=model_dir, tensor_parallel_size=tensor_parallel_size,
+    if not Path(MODEL_PATH).exists():
+        raise FileNotFoundError(f"Model directory not found: {MODEL_PATH}")
+
+    data = load_dataset(DATASET_NAME, cache_dir=HF_CACHE)
+    split = data["test"] if hasattr(data, "keys") and "test" in data else data
+    prompts, gold = [], []
+    for row in split:
+        question = row.get("problem", row.get("question"))
+        if question is None or row.get("answer") is None:
+            raise ValueError("Each AIME record must contain problem/question and answer")
+        prompts.append(prompt(str(question)))
+        gold.append(int(row["answer"]))
+
+    sampling = SamplingParams(max_tokens=max_new_tokens, temperature=temperature,
+                              top_p=top_p, top_k=top_k,
+                              repetition_penalty=repetition_penalty)
+    # CUDA is selected automatically by vLLM; use CUDA_VISIBLE_DEVICES to pin GPUs.
+    llm = LLM(model=MODEL_PATH, tensor_parallel_size=TENSOR_PARALLEL_SIZE,
               trust_remote_code=True)
+    generated = llm.generate(prompts, sampling)
+
     results, correct = [], 0
-    for record, output in zip(records, llm.generate(prompts, params)):
+    for index, (row, output, expected) in enumerate(zip(split, generated, gold)):
         raw = output.outputs[0].text if output.outputs else ""
-        pred = extract_answer(raw); ok = pred == record["gold"]; correct += int(ok)
-        results.append({**record, "pred": pred, "correct": ok, "raw": raw})
-    total = len(results); accuracy = correct / total
-    print(f"AIME26: {correct}/{total} correct, accuracy={accuracy:.4f}")
-    os.makedirs(os.path.dirname(final_result_path) or ".", exist_ok=True); os.makedirs(sub_log_dir, exist_ok=True)
-    with open(final_result_path, "w", encoding="utf-8") as f:
-        json.dump({"model": model_dir, "dataset": "math-ai/aime26", "total": total,
-                   "correct": correct, "accuracy": accuracy, "results": results}, f,
-                  ensure_ascii=False, indent=2)
+        predicted = answer_from(raw)
+        ok = predicted == expected
+        correct += int(ok)
+        results.append({"index": index, "question": row.get("problem", row.get("question")),
+                        "gold": expected, "pred": predicted, "correct": ok, "raw": raw})
+
+    report = {"model": MODEL_PATH, "dataset": DATASET_NAME, "total": len(gold),
+              "correct": correct, "accuracy": correct / len(gold), "results": results}
+    os.makedirs(os.path.dirname(RESULT_PATH), exist_ok=True)
+    with open(RESULT_PATH, "w", encoding="utf-8") as stream:
+        json.dump(report, stream, ensure_ascii=False, indent=2)
+    print(f"AIME26 result: {correct}/{len(gold)} ({report['accuracy']:.4f})")
+    print(f"Saved to: {RESULT_PATH}")
+
 
 if __name__ == "__main__":
     main()

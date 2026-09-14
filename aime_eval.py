@@ -6,7 +6,7 @@ import torch.multiprocessing as mp
 from datasets import load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-max_new_tokens, temperature, enable_thinking = 2048, 0.85, True
+max_new_tokens, temperature, enable_thinking = 32768, 0.85, True
 top_p, top_k, repetition_penalty = 0.95, 20, 1.05
 MODEL_PATH = "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B"
 HF_CACHE = "/mnt/data/user/zhang_jingdong/hf_cache"
@@ -22,16 +22,29 @@ def extract_answer(text):
             return int(found[-1])
     return None
 
-def worker(rank, rows):
+def worker(rank, rows, model_load_lock):
     path = SHARD_DIR / f"shard_{rank}.json"
     try:
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
-        processor = AutoProcessor.from_pretrained(MODEL_PATH, cache_dir=HF_CACHE,
-                                                  trust_remote_code=True)
-        model = AutoModelForImageTextToText.from_pretrained(
-            MODEL_PATH, cache_dir=HF_CACHE, dtype=torch.bfloat16,
-            trust_remote_code=True).to(device).eval()
+
+        # Loading all eight replicas at exactly the same time can create a
+        # large transient host/GPU-memory peak. Serialize only model loading;
+        # inference starts immediately after this worker releases the lock.
+        with model_load_lock:
+            torch.cuda.empty_cache()
+            print(f"GPU {rank}: loading model...", flush=True)
+            processor = AutoProcessor.from_pretrained(
+                MODEL_PATH, cache_dir=HF_CACHE, trust_remote_code=True,
+                local_files_only=True,
+            )
+            model = AutoModelForImageTextToText.from_pretrained(
+                MODEL_PATH, cache_dir=HF_CACHE, dtype=torch.bfloat16,
+                trust_remote_code=True, low_cpu_mem_usage=True,
+                local_files_only=True,
+            ).to(device).eval()
+            torch.cuda.empty_cache()
+            print(f"GPU {rank}: model loaded; starting inference.", flush=True)
         results = []
         for index in range(rank, len(rows), GPU_COUNT):
             row = rows[index]
@@ -71,7 +84,9 @@ def main():
     split = dataset["test"] if "test" in dataset else dataset[next(iter(dataset.keys()))]
     rows = [dict(row) for row in split]
     context = mp.get_context("spawn")
-    processes = [context.Process(target=worker, args=(rank, rows)) for rank in range(GPU_COUNT)]
+    model_load_lock = context.Lock()
+    processes = [context.Process(target=worker, args=(rank, rows, model_load_lock))
+                 for rank in range(GPU_COUNT)]
     for process in processes: process.start()
     for process in processes: process.join()
     failed = [i for i, process in enumerate(processes) if process.exitcode]

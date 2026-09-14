@@ -44,8 +44,10 @@ def main() -> None:
     # quantization metadata (or with the vLLM version-specific quantization
     # option).  The original parameter is retained above for configuration
     # compatibility but is not forwarded to unsupported vLLM versions.
+    # Newer vLLM versions select CUDA automatically and no longer accept
+    # ``device`` in EngineArgs. CUDA_VISIBLE_DEVICES controls GPU selection.
     llm = LLM(model=model_dir, tensor_parallel_size=tensor_parallel_size,
-              trust_remote_code=True, device="cuda")
+              trust_remote_code=True)
     results, correct = [], 0
     for record, output in zip(records, llm.generate(prompts, params)):
         raw = output.outputs[0].text if output.outputs else ""

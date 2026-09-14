@@ -24,6 +24,15 @@ def extract_answer(text):
 
 def worker(rank, rows, model_load_lock):
     path = SHARD_DIR / f"shard_{rank}.json"
+    log_path = SHARD_DIR / f"gpu_{rank}.log"
+    SHARD_DIR.mkdir(parents=True, exist_ok=True)
+
+    def log(message):
+        line = f"[GPU {rank}] {message}"
+        print(line, flush=True)
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+
     try:
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
@@ -33,7 +42,7 @@ def worker(rank, rows, model_load_lock):
         # inference starts immediately after this worker releases the lock.
         with model_load_lock:
             torch.cuda.empty_cache()
-            print(f"GPU {rank}: loading model...", flush=True)
+            log("loading model...")
             processor = AutoProcessor.from_pretrained(
                 MODEL_PATH, cache_dir=HF_CACHE, trust_remote_code=True,
                 local_files_only=True,
@@ -44,11 +53,12 @@ def worker(rank, rows, model_load_lock):
                 local_files_only=True,
             ).to(device).eval()
             torch.cuda.empty_cache()
-            print(f"GPU {rank}: model loaded; starting inference.", flush=True)
+            log("model loaded; starting inference.")
         results = []
         for index in range(rank, len(rows), GPU_COUNT):
             row = rows[index]
             question = str(row.get("problem") or row.get("question"))
+            log(f"starting question index={index}, text={question[:100].replace(chr(10), ' ')}")
             messages = [{"role": "user", "content": question +
                          "\nSolve step by step and put the final integer in \\boxed{...}."}]
             try:
@@ -68,10 +78,13 @@ def worker(rank, rows, model_load_lock):
             pred, gold = extract_answer(response), int(row["answer"])
             results.append({"index": index, "question": question, "gold": gold,
                             "pred": pred, "correct": pred == gold, "raw": response})
+            log(f"finished question index={index}, prediction={pred}, gold={gold}, correct={pred == gold}")
             del inputs, output
             torch.cuda.empty_cache()
         path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"completed all assigned questions: {len(results)}")
     except Exception:
+        log("worker failed; see traceback in shard file")
         path.write_text(json.dumps({"gpu": rank, "error": traceback.format_exc()},
                                    ensure_ascii=False, indent=2), encoding="utf-8")
         raise

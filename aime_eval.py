@@ -17,7 +17,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-MAX_NEW_TOKENS, TEMPERATURE, ENABLE_THINKING = 8192, 0.85, True
+MAX_NEW_TOKENS, TEMPERATURE, ENABLE_THINKING = 32768, 0.85, True
 TOP_P, TOP_K, REPETITION_PENALTY = 0.95, 20, 1.05
 MODEL_PATH = "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B"
 DATASET_NAME = "math-ai/aime26"

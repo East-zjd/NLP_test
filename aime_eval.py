@@ -53,7 +53,7 @@ def worker(rank, indices, rows):
     try:
         tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, cache_dir=HF_CACHE, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH, cache_dir=HF_CACHE, torch_dtype=torch.bfloat16,
+            MODEL_PATH, cache_dir=HF_CACHE, dtype=torch.bfloat16,
             device_map={"": 0}, trust_remote_code=True,
         ).eval()
         results = []

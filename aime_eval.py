@@ -1,5 +1,5 @@
 """Eight independent Transformers workers evaluate Qwen3.5-2B on AIME26."""
-import json, re, traceback
+import json, os, re, traceback
 from pathlib import Path
 import torch
 import torch.multiprocessing as mp
@@ -9,7 +9,9 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 max_new_tokens, temperature, enable_thinking = 32768, 0.85, True
 top_p, top_k, repetition_penalty = 0.95, 20, 1.05
 MODEL_PATH = "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B"
-HF_CACHE = "/mnt/data/user/zhang_jingdong/hf_cache"
+# Respect the server's HF_HOME setting. This avoids unwritable shared-cache
+# lock files while retaining a usable default when HF_HOME is unset.
+HF_CACHE = os.environ.get("HF_HOME", "/mnt/data/user/zhang_jingdong/hf_cache")
 RESULT_PATH = "/mnt/data/user/zhang_jingdong/NLP_test/eval_result.json"
 SHARD_DIR = Path("/mnt/data/user/zhang_jingdong/NLP_test/sub_logs")
 GPU_COUNT = 8
@@ -36,6 +38,7 @@ def worker(rank, rows, model_load_lock):
     try:
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         # Loading all eight replicas at exactly the same time can create a
         # large transient host/GPU-memory peak. Serialize only model loading;
@@ -48,7 +51,7 @@ def worker(rank, rows, model_load_lock):
                 local_files_only=True,
             )
             model = AutoModelForImageTextToText.from_pretrained(
-                MODEL_PATH, cache_dir=HF_CACHE, dtype=torch.bfloat16,
+                MODEL_PATH, cache_dir=HF_CACHE, dtype=dtype,
                 trust_remote_code=True, low_cpu_mem_usage=True,
                 local_files_only=True,
             ).to(device).eval()

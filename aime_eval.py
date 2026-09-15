@@ -1,14 +1,18 @@
 """Eight independent Transformers workers evaluate Qwen3.5-2B on AIME26."""
 import json, os, re, traceback
+from datetime import datetime
 from pathlib import Path
 import torch
 import torch.multiprocessing as mp
-from datasets import load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-max_new_tokens, temperature, enable_thinking = 32768, 0.85, True
+max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "32768"))
+temperature, enable_thinking = 0.85, True
 top_p, top_k, repetition_penalty = 0.95, 20, 1.05
-MODEL_PATH = "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B"
+MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B")
+DATA_PATH = Path(os.environ.get(
+    "DATA_PATH", "/mnt/data/user/zhang_jingdong/aime26/aime2026.jsonl"
+))
 # Respect the server's HF_HOME setting. This avoids unwritable shared-cache
 # lock files while retaining a usable default when HF_HOME is unset.
 HF_CACHE = os.environ.get("HF_HOME", "/mnt/data/user/zhang_jingdong/hf_cache")
@@ -18,7 +22,7 @@ RESULT_PATH = os.environ.get(
 SHARD_DIR = Path(os.environ.get(
     "SHARD_DIR", "/mnt/data/user/zhang_jingdong/NLP_test/sub_logs"
 ))
-GPU_COUNT = 8
+GPU_COUNT = int(os.environ.get("GPU_COUNT", "8"))
 
 def extract_answer(text):
     for pattern in (r"\\boxed\s*\{\s*(\d{1,3})\s*\}",
@@ -28,13 +32,51 @@ def extract_answer(text):
             return int(found[-1])
     return None
 
-def worker(rank, rows, model_load_lock):
+def normalize_gold(value):
+    """Accept integer answers and strings such as ``\\boxed{123}``."""
+    if isinstance(value, int):
+        return value
+    match = re.search(r"\d{1,3}", str(value))
+    if not match:
+        raise ValueError(f"Cannot parse gold answer: {value!r}")
+    return int(match.group())
+
+def load_jsonl(path):
+    """Load and minimally validate the local AIME26 JSONL dataset."""
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"AIME26 data file not found: {path}. Set DATA_PATH if it is elsewhere."
+        )
+    rows = []
+    with path.open("r", encoding="utf-8-sig") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON at {path}:{line_number}: {error}") from error
+            question = row.get("problem") or row.get("question")
+            if not question:
+                raise ValueError(
+                    f"Missing 'problem' or 'question' at {path}:{line_number}"
+                )
+            if "answer" not in row:
+                raise ValueError(f"Missing 'answer' at {path}:{line_number}")
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"No questions found in {path}")
+    return rows
+
+def worker(rank, assigned_rows, model_load_lock):
     path = SHARD_DIR / f"shard_{rank}.json"
     log_path = SHARD_DIR / f"gpu_{rank}.log"
     SHARD_DIR.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("", encoding="utf-8")
+    path.write_text("[]", encoding="utf-8")
 
     def log(message):
-        line = f"[GPU {rank}] {message}"
+        line = f"[{datetime.now().isoformat(timespec='seconds')}] [GPU {rank}] {message}"
         print(line, flush=True)
         try:
             with log_path.open("a", encoding="utf-8") as stream:
@@ -58,15 +100,15 @@ def worker(rank, rows, model_load_lock):
                 local_files_only=True,
             )
             model = AutoModelForImageTextToText.from_pretrained(
-                MODEL_PATH, cache_dir=HF_CACHE, dtype=dtype,
+                MODEL_PATH, cache_dir=HF_CACHE, torch_dtype=dtype,
                 trust_remote_code=True, low_cpu_mem_usage=True,
                 local_files_only=True,
             ).to(device).eval()
             torch.cuda.empty_cache()
             log("model loaded; starting inference.")
         results = []
-        for index in range(rank, len(rows), GPU_COUNT):
-            row = rows[index]
+        log(f"assigned {len(assigned_rows)} questions")
+        for index, row in assigned_rows:
             question = str(row.get("problem") or row.get("question"))
             log(f"starting question index={index}, text={question[:100].replace(chr(10), ' ')}")
             messages = [{"role": "user", "content": question +
@@ -85,30 +127,37 @@ def worker(rank, rows, model_load_lock):
                     pad_token_id=processor.tokenizer.eos_token_id)
             response = processor.decode(output[0, inputs.input_ids.shape[1]:],
                                         skip_special_tokens=True)
-            pred, gold = extract_answer(response), int(row["answer"])
+            pred, gold = extract_answer(response), normalize_gold(row["answer"])
             results.append({"index": index, "question": question, "gold": gold,
-                            "pred": pred, "correct": pred == gold, "raw": response})
+                            "pred": pred, "correct": pred == gold, "raw": response,
+                            "gpu": rank})
             log(f"finished question index={index}, prediction={pred}, gold={gold}, correct={pred == gold}")
             del inputs, output
             torch.cuda.empty_cache()
+            path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
         path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"completed all assigned questions: {len(results)}")
     except Exception:
-        log("worker failed; see traceback in shard file")
-        path.write_text(json.dumps({"gpu": rank, "error": traceback.format_exc()},
+        error = traceback.format_exc()
+        log(f"worker failed:\n{error}")
+        path.write_text(json.dumps({"gpu": rank, "error": error},
                                    ensure_ascii=False, indent=2), encoding="utf-8")
         raise
 
 def main():
-    if torch.cuda.device_count() < GPU_COUNT:
-        raise RuntimeError(f"Need {GPU_COUNT} GPUs, found {torch.cuda.device_count()}")
+    available_gpus = torch.cuda.device_count()
+    if GPU_COUNT < 1 or GPU_COUNT > available_gpus:
+        raise RuntimeError(f"GPU_COUNT must be between 1 and {available_gpus}, got {GPU_COUNT}")
     SHARD_DIR.mkdir(parents=True, exist_ok=True)
-    dataset = load_dataset("math-ai/aime26", cache_dir=HF_CACHE)
-    split = dataset["test"] if "test" in dataset else dataset[next(iter(dataset.keys()))]
-    rows = [dict(row) for row in split]
+    rows = load_jsonl(DATA_PATH)
+    print(f"Loaded {len(rows)} questions from {DATA_PATH}", flush=True)
+    indexed_rows = list(enumerate(rows))
+    assignments = [indexed_rows[rank::GPU_COUNT] for rank in range(GPU_COUNT)]
     context = mp.get_context("spawn")
     model_load_lock = context.Lock()
-    processes = [context.Process(target=worker, args=(rank, rows, model_load_lock))
+    processes = [context.Process(target=worker,
+                                 args=(rank, assignments[rank], model_load_lock),
+                                 name=f"aime-gpu-{rank}")
                  for rank in range(GPU_COUNT)]
     for process in processes: process.start()
     for process in processes: process.join()
@@ -117,11 +166,15 @@ def main():
         raise RuntimeError(f"GPU workers failed: {failed}; inspect {SHARD_DIR}/shard_<id>.json")
     merged = []
     for rank in range(GPU_COUNT):
-        merged.extend(json.loads((SHARD_DIR / f"shard_{rank}.json").read_text(encoding="utf-8")))
+        shard = json.loads((SHARD_DIR / f"shard_{rank}.json").read_text(encoding="utf-8"))
+        if not isinstance(shard, list):
+            raise RuntimeError(f"GPU {rank} produced an invalid shard: {shard}")
+        merged.extend(shard)
     merged.sort(key=lambda item: item["index"])
     correct = sum(item["correct"] for item in merged)
-    report = {"model": MODEL_PATH, "dataset": "math-ai/aime26", "total": len(merged),
-              "correct": correct, "accuracy": correct / len(merged), "results": merged}
+    report = {"model": MODEL_PATH, "dataset": str(DATA_PATH), "total": len(merged),
+              "gpu_count": GPU_COUNT, "correct": correct,
+              "accuracy": correct / len(merged) if merged else 0.0, "results": merged}
     Path(RESULT_PATH).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"AIME26: {correct}/{len(merged)}, accuracy={report['accuracy']:.4f}")
     print(f"Saved to {RESULT_PATH}")

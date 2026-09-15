@@ -79,7 +79,11 @@ def worker(rank, assigned_rows, model_load_lock, result_queue):
     try:
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # RTX 2080 Ti is compute capability 7.5 and cannot execute BF16
+        # kernels.  Do not rely only on is_bf16_supported(), which can be
+        # optimistic with some CUDA/PyTorch combinations.
+        capability = torch.cuda.get_device_capability(rank)
+        dtype = torch.bfloat16 if capability[0] >= 8 else torch.float16
 
         # Loading all eight replicas at exactly the same time can create a
         # large transient host/GPU-memory peak. Serialize only model loading;
@@ -97,7 +101,7 @@ def worker(rank, assigned_rows, model_load_lock, result_queue):
                 local_files_only=True,
             ).to(device).eval()
             torch.cuda.empty_cache()
-            log("model loaded; starting inference.")
+            log(f"model loaded; starting inference (compute_capability={capability}, dtype={dtype}).")
         log(f"assigned {len(assigned_rows)} questions")
         for index, row, rollout in assigned_rows:
             question = str(row.get("problem") or row.get("question"))
@@ -156,6 +160,8 @@ def main():
     if GPU_COUNT < 1 or GPU_COUNT > available_gpus:
         raise RuntimeError(f"GPU_COUNT must be between 1 and {available_gpus}, got {GPU_COUNT}")
     rows = load_jsonl(DATA_PATH)
+    print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}", flush=True)
+    print(f"Detected GPUs={available_gpus}, using GPU_COUNT={GPU_COUNT}", flush=True)
     print(f"Loaded {len(rows)} questions from {DATA_PATH}", flush=True)
     print(f"MAX_NEW_TOKENS={MAX_NEW_TOKENS}", flush=True)
     print(f"ENABLE_THINKING={ENABLE_THINKING}", flush=True)

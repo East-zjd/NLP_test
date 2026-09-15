@@ -12,8 +12,12 @@ MODEL_PATH = "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B"
 # Respect the server's HF_HOME setting. This avoids unwritable shared-cache
 # lock files while retaining a usable default when HF_HOME is unset.
 HF_CACHE = os.environ.get("HF_HOME", "/mnt/data/user/zhang_jingdong/hf_cache")
-RESULT_PATH = "/mnt/data/user/zhang_jingdong/NLP_test/eval_result.json"
-SHARD_DIR = Path("/mnt/data/user/zhang_jingdong/NLP_test/sub_logs")
+RESULT_PATH = os.environ.get(
+    "RESULT_PATH", "/mnt/data/user/zhang_jingdong/NLP_test/eval_result.json"
+)
+SHARD_DIR = Path(os.environ.get(
+    "SHARD_DIR", "/mnt/data/user/zhang_jingdong/NLP_test/sub_logs"
+))
 GPU_COUNT = 8
 
 def extract_answer(text):
@@ -32,8 +36,11 @@ def worker(rank, rows, model_load_lock):
     def log(message):
         line = f"[GPU {rank}] {message}"
         print(line, flush=True)
-        with log_path.open("a", encoding="utf-8") as stream:
-            stream.write(line + "\n")
+        try:
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(line + "\n")
+        except OSError as error:
+            print(f"[GPU {rank}] could not write log {log_path}: {error}", flush=True)
 
     try:
         torch.cuda.set_device(rank)

@@ -130,17 +130,20 @@ def worker(rank, assigned_rows, model_load_lock, result_queue):
                 del inputs, output
                 torch.cuda.empty_cache()
             except Exception:
+                error_text = traceback.format_exc()
                 result = {"index": index, "question": question,
                           "gold": row.get("answer"), "pred": None, "correct": False,
                           "raw": "", "gpu": rank, "rollout": rollout,
-                          "error": traceback.format_exc()}
+                          "generated_tokens": 0, "hit_token_limit": False,
+                          "error": error_text}
             result_queue.put(("result", result))
             log(f"finished question index={index}, prediction={result['pred']}, "
                 f"gold={result['gold']}, correct={result['correct']}")
-            if result["pred"] is None and result.get("raw"):
-                tail = result["raw"][-400:].replace("\n", " ")
-                log(f"answer not found; rollout={rollout}, tokens={result['generated_tokens']}, "
-                    f"hit_limit={result['hit_token_limit']}, response_tail={tail!r}")
+            if result["pred"] is None:
+                tail = result.get("raw", "")[-400:].replace("\n", " ")
+                log(f"answer not found; rollout={rollout}, tokens={result.get('generated_tokens', 0)}, "
+                    f"hit_limit={result.get('hit_token_limit', False)}, "
+                    f"error={result.get('error', '')[-500:]}, response_tail={tail!r}")
         result_queue.put(("done", rank))
         log(f"completed all assigned questions: {len(assigned_rows)}")
     except Exception:

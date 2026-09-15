@@ -6,10 +6,14 @@ import torch
 import torch.multiprocessing as mp
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "8192"))
-temperature = float(os.environ.get("TEMPERATURE", "0.8"))
-enable_thinking = os.environ.get("ENABLE_THINKING", "1") == "1"
-top_p, top_k, repetition_penalty = 0.95, 20, 1.05
+MAX_NEW_TOKENS = 32768
+ENABLE_THINKING = True
+DO_SAMPLE = True
+TEMPERATURE = 0.85
+TOP_P = 0.95
+TOP_K = 20
+REPETITION_PENALTY = 1.05
+ROLLOUTS_PER_QUESTION = 8
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B")
 DATA_PATH = Path(os.environ.get(
     "DATA_PATH", "/mnt/data/user/zhang_jingdong/aime26/aime2026.jsonl"
@@ -95,7 +99,7 @@ def worker(rank, assigned_rows, model_load_lock, result_queue):
             torch.cuda.empty_cache()
             log("model loaded; starting inference.")
         log(f"assigned {len(assigned_rows)} questions")
-        for index, row in assigned_rows:
+        for index, row, rollout in assigned_rows:
             question = str(row.get("problem") or row.get("question"))
             log(f"starting question index={index}, text={question[:100].replace(chr(10), ' ')}")
             try:
@@ -103,16 +107,16 @@ def worker(rank, assigned_rows, model_load_lock, result_queue):
                              "\nSolve step by step and put the final integer in \\boxed{...}."}]
                 try:
                     prompt = processor.apply_chat_template(messages, tokenize=False,
-                        add_generation_prompt=True, enable_thinking=enable_thinking)
+                        add_generation_prompt=True, enable_thinking=ENABLE_THINKING)
                 except TypeError:
                     prompt = processor.apply_chat_template(messages, tokenize=False,
                                                             add_generation_prompt=True)
                 inputs = processor(text=prompt, return_tensors="pt").to(device)
                 with torch.inference_mode():
-                    output = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                        temperature=temperature, top_p=top_p, top_k=top_k,
-                        repetition_penalty=repetition_penalty,
-                        do_sample=temperature > 0,
+                    output = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
+                        temperature=TEMPERATURE, top_p=TOP_P, top_k=TOP_K,
+                        repetition_penalty=REPETITION_PENALTY,
+                        do_sample=DO_SAMPLE,
                         pad_token_id=processor.tokenizer.eos_token_id)
                 generated_tokens = output.shape[1] - inputs.input_ids.shape[1]
                 response = processor.decode(output[0, inputs.input_ids.shape[1]:],
@@ -120,20 +124,22 @@ def worker(rank, assigned_rows, model_load_lock, result_queue):
                 pred, gold = extract_answer(response), normalize_gold(row["answer"])
                 result = {"index": index, "question": question, "gold": gold,
                           "pred": pred, "correct": pred == gold, "raw": response,
-                          "gpu": rank, "generated_tokens": generated_tokens,
-                          "hit_token_limit": generated_tokens >= max_new_tokens}
+                          "gpu": rank, "rollout": rollout,
+                          "generated_tokens": generated_tokens,
+                          "hit_token_limit": generated_tokens >= MAX_NEW_TOKENS}
                 del inputs, output
                 torch.cuda.empty_cache()
             except Exception:
                 result = {"index": index, "question": question,
                           "gold": row.get("answer"), "pred": None, "correct": False,
-                          "raw": "", "gpu": rank, "error": traceback.format_exc()}
+                          "raw": "", "gpu": rank, "rollout": rollout,
+                          "error": traceback.format_exc()}
             result_queue.put(("result", result))
             log(f"finished question index={index}, prediction={result['pred']}, "
                 f"gold={result['gold']}, correct={result['correct']}")
             if result["pred"] is None and result.get("raw"):
                 tail = result["raw"][-400:].replace("\n", " ")
-                log(f"answer not found; tokens={result['generated_tokens']}, "
+                log(f"answer not found; rollout={rollout}, tokens={result['generated_tokens']}, "
                     f"hit_limit={result['hit_token_limit']}, response_tail={tail!r}")
         result_queue.put(("done", rank))
         log(f"completed all assigned questions: {len(assigned_rows)}")
@@ -148,10 +154,20 @@ def main():
         raise RuntimeError(f"GPU_COUNT must be between 1 and {available_gpus}, got {GPU_COUNT}")
     rows = load_jsonl(DATA_PATH)
     print(f"Loaded {len(rows)} questions from {DATA_PATH}", flush=True)
-    print(f"Generation: max_new_tokens={max_new_tokens}, "
-          f"enable_thinking={enable_thinking}, temperature={temperature}", flush=True)
-    indexed_rows = list(enumerate(rows))
-    assignments = [indexed_rows[rank::GPU_COUNT] for rank in range(GPU_COUNT)]
+    print(f"MAX_NEW_TOKENS={MAX_NEW_TOKENS}", flush=True)
+    print(f"ENABLE_THINKING={ENABLE_THINKING}", flush=True)
+    print(f"DO_SAMPLE={DO_SAMPLE}", flush=True)
+    print(f"TEMPERATURE={TEMPERATURE}", flush=True)
+    print(f"TOP_P={TOP_P}", flush=True)
+    print(f"TOP_K={TOP_K}", flush=True)
+    print(f"REPETITION_PENALTY={REPETITION_PENALTY}", flush=True)
+    print(f"ROLLOUTS_PER_QUESTION={ROLLOUTS_PER_QUESTION}", flush=True)
+    jobs = [
+        (index, row, rollout)
+        for index, row in enumerate(rows)
+        for rollout in range(ROLLOUTS_PER_QUESTION)
+    ]
+    assignments = [jobs[rank::GPU_COUNT] for rank in range(GPU_COUNT)]
     context = mp.get_context("spawn")
     model_load_lock = context.Lock()
     result_queue = context.Queue()
@@ -162,13 +178,15 @@ def main():
                  for rank in range(GPU_COUNT)]
     for process in processes: process.start()
     merged, worker_errors, done_workers = [], [], 0
+    total_jobs = len(rows) * ROLLOUTS_PER_QUESTION
     while done_workers + len(worker_errors) < GPU_COUNT:
         kind, payload = result_queue.get()
         if kind == "result":
             merged.append(payload)
             correct_so_far = sum(item["correct"] for item in merged)
-            print(f"Progress: {len(merged)}/{len(rows)}, correct={correct_so_far}, "
-                  f"latest=GPU{payload['gpu']}/question{payload['index']}", flush=True)
+            print(f"Progress: {len(merged)}/{total_jobs} rollouts, "
+                  f"correct={correct_so_far}, latest=GPU{payload['gpu']}/"
+                  f"question{payload['index']}/rollout{payload['rollout']}", flush=True)
         elif kind == "done":
             done_workers += 1
         else:
@@ -178,12 +196,32 @@ def main():
     if failed or worker_errors:
         details = "\n".join(item["error"] for item in worker_errors)
         raise RuntimeError(f"GPU workers failed: {failed}\n{details}")
-    merged.sort(key=lambda item: item["index"])
-    correct = sum(item["correct"] for item in merged)
-    report = {"model": MODEL_PATH, "dataset": str(DATA_PATH), "total": len(merged),
-              "gpu_count": GPU_COUNT, "correct": correct,
-              "accuracy": correct / len(merged) if merged else 0.0, "results": merged}
-    print(f"AIME26: {correct}/{len(merged)}, accuracy={report['accuracy']:.4f}", flush=True)
+    merged.sort(key=lambda item: (item["index"], item["rollout"]))
+    grouped = {index: [] for index in range(len(rows))}
+    for item in merged:
+        grouped[item["index"]].append(item)
+    pass_at_n = sum(any(item["correct"] for item in items) for items in grouped.values())
+    majority_items = []
+    for index, items in grouped.items():
+        votes = {}
+        for item in items:
+            if item["pred"] is not None:
+                votes[item["pred"]] = votes.get(item["pred"], 0) + 1
+        majority_pred = max(votes, key=votes.get) if votes else None
+        gold = normalize_gold(rows[index]["answer"])
+        majority_items.append({"index": index, "gold": gold, "pred": majority_pred,
+                               "correct": majority_pred == gold, "votes": votes})
+    majority_correct = sum(item["correct"] for item in majority_items)
+    report = {"model": MODEL_PATH, "dataset": str(DATA_PATH), "total_questions": len(rows),
+              "rollouts_per_question": ROLLOUTS_PER_QUESTION, "gpu_count": GPU_COUNT,
+              "pass_at_n_correct": pass_at_n, "pass_at_n_accuracy": pass_at_n / len(rows),
+              "majority_correct": majority_correct,
+              "majority_accuracy": majority_correct / len(rows),
+              "majority_results": majority_items, "rollout_results": merged}
+    print(f"AIME26 pass@{ROLLOUTS_PER_QUESTION}: {pass_at_n}/{len(rows)}, "
+          f"accuracy={report['pass_at_n_accuracy']:.4f}", flush=True)
+    print(f"AIME26 majority@{ROLLOUTS_PER_QUESTION}: {majority_correct}/{len(rows)}, "
+          f"accuracy={report['majority_accuracy']:.4f}", flush=True)
     if RESULT_PATH:
         Path(RESULT_PATH).write_text(json.dumps(report, ensure_ascii=False, indent=2),
                                     encoding="utf-8")

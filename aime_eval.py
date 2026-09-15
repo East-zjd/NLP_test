@@ -7,7 +7,7 @@ import torch.multiprocessing as mp
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "8192"))
-temperature = float(os.environ.get("TEMPERATURE", "0"))
+temperature = float(os.environ.get("TEMPERATURE", "0.8"))
 enable_thinking = os.environ.get("ENABLE_THINKING", "1") == "1"
 top_p, top_k, repetition_penalty = 0.95, 20, 1.05
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B")

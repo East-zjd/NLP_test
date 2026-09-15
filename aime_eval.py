@@ -6,8 +6,9 @@ import torch
 import torch.multiprocessing as mp
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "4096"))
-temperature, enable_thinking = 0.85, True
+max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "2048"))
+temperature = float(os.environ.get("TEMPERATURE", "0"))
+enable_thinking = os.environ.get("ENABLE_THINKING", "0") == "1"
 top_p, top_k, repetition_penalty = 0.95, 20, 1.05
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B")
 DATA_PATH = Path(os.environ.get(
@@ -22,7 +23,9 @@ GPU_COUNT = int(os.environ.get("GPU_COUNT", "8"))
 
 def extract_answer(text):
     for pattern in (r"\\boxed\s*\{\s*(\d{1,3})\s*\}",
-                    r"(?:final\s+)?answer\s*[:：]\s*(\d{1,3})\b"):
+                    r"\\boxed\s+(\d{1,3})\b",
+                    r"(?:final\s+)?answer\s*(?:is|=|[:：])\s*(\d{1,3})\b",
+                    r"答案\s*(?:是|为|=|[:：])\s*(\d{1,3})\b"):
         found = re.findall(pattern, text, re.I)
         if found:
             return int(found[-1])
@@ -108,14 +111,17 @@ def worker(rank, assigned_rows, model_load_lock, result_queue):
                 with torch.inference_mode():
                     output = model.generate(**inputs, max_new_tokens=max_new_tokens,
                         temperature=temperature, top_p=top_p, top_k=top_k,
-                        repetition_penalty=repetition_penalty, do_sample=True,
+                        repetition_penalty=repetition_penalty,
+                        do_sample=temperature > 0,
                         pad_token_id=processor.tokenizer.eos_token_id)
+                generated_tokens = output.shape[1] - inputs.input_ids.shape[1]
                 response = processor.decode(output[0, inputs.input_ids.shape[1]:],
                                             skip_special_tokens=True)
                 pred, gold = extract_answer(response), normalize_gold(row["answer"])
                 result = {"index": index, "question": question, "gold": gold,
                           "pred": pred, "correct": pred == gold, "raw": response,
-                          "gpu": rank}
+                          "gpu": rank, "generated_tokens": generated_tokens,
+                          "hit_token_limit": generated_tokens >= max_new_tokens}
                 del inputs, output
                 torch.cuda.empty_cache()
             except Exception:
@@ -125,6 +131,10 @@ def worker(rank, assigned_rows, model_load_lock, result_queue):
             result_queue.put(("result", result))
             log(f"finished question index={index}, prediction={result['pred']}, "
                 f"gold={result['gold']}, correct={result['correct']}")
+            if result["pred"] is None and result.get("raw"):
+                tail = result["raw"][-400:].replace("\n", " ")
+                log(f"answer not found; tokens={result['generated_tokens']}, "
+                    f"hit_limit={result['hit_token_limit']}, response_tail={tail!r}")
         result_queue.put(("done", rank))
         log(f"completed all assigned questions: {len(assigned_rows)}")
     except Exception:
@@ -138,6 +148,8 @@ def main():
         raise RuntimeError(f"GPU_COUNT must be between 1 and {available_gpus}, got {GPU_COUNT}")
     rows = load_jsonl(DATA_PATH)
     print(f"Loaded {len(rows)} questions from {DATA_PATH}", flush=True)
+    print(f"Generation: max_new_tokens={max_new_tokens}, "
+          f"enable_thinking={enable_thinking}, temperature={temperature}", flush=True)
     indexed_rows = list(enumerate(rows))
     assignments = [indexed_rows[rank::GPU_COUNT] for rank in range(GPU_COUNT)]
     context = mp.get_context("spawn")

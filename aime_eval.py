@@ -6,7 +6,7 @@ import torch
 import torch.multiprocessing as mp
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "2048"))
+max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "4096"))
 temperature = float(os.environ.get("TEMPERATURE", "0"))
 enable_thinking = os.environ.get("ENABLE_THINKING", "1") == "1"
 top_p, top_k, repetition_penalty = 0.95, 20, 1.05

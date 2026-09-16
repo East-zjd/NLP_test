@@ -13,7 +13,7 @@ TEMPERATURE = 0.85
 TOP_P = 0.95
 TOP_K = 20
 REPETITION_PENALTY = 1.05
-ROLLOUTS_PER_QUESTION = 8
+ROLLOUTS_PER_QUESTION = 1
 MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/data/user/zhang_jingdong/models/Qwen3.5-2B")
 DATA_PATH = Path(os.environ.get(
     "DATA_PATH", "/mnt/data/user/zhang_jingdong/aime26/aime2026.jsonl"

@@ -6,10 +6,10 @@ import torch
 import torch.multiprocessing as mp
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-MAX_NEW_TOKENS = 16384
+MAX_NEW_TOKENS = 32768
 ENABLE_THINKING = True
 DO_SAMPLE = True
-TEMPERATURE = 0.85
+TEMPERATURE = 0.9
 TOP_P = 0.95
 TOP_K = 20
 REPETITION_PENALTY = 1.05
